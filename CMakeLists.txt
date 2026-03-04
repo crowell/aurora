@@ -55,6 +55,25 @@ add_library(aurora_shared SHARED
   lib/dolphin/mtx/mtx44.c
   lib/dolphin/mtx/vec.c
   lib/dolphin/mtx/quat.c
+  # aurora_os sources
+  lib/dolphin/os/OSInit.cpp
+  lib/dolphin/os/OSMemory.cpp
+  lib/dolphin/os/OSBootInfo.cpp
+  lib/dolphin/os/OSTime.cpp
+  lib/dolphin/os/OSArena.cpp
+  lib/dolphin/os/OSAddress.cpp
+  lib/dolphin/os/OSReport.cpp
+  lib/dolphin/os/OSCache.cpp
+  lib/dolphin/AR.cpp
+  # aurora_gd sources
+  lib/dolphin/gd/GDBase.cpp
+  lib/dolphin/gd/GDGeometry.cpp
+  lib/dolphin/gd/GDIndirect.cpp
+  lib/dolphin/gd/GDLight.cpp
+  lib/dolphin/gd/GDPixel.cpp
+  lib/dolphin/gd/GDTev.cpp
+  lib/dolphin/gd/GDTexture.cpp
+  lib/dolphin/gd/GDTransform.cpp
 )
 add_library(aurora::shared ALIAS aurora_shared)
 
