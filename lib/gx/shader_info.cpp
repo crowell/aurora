@@ -230,7 +230,7 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
       continue;
     }
     const auto& tcg = config.tcgs[i];
-    if (tcg.mtx != GX_IDENTITY) {
+    if (tcg.mtx != GX_IDENTITY && tcg.mtx >= GX_TEXMTX0 && tcg.mtx <= GX_TEXMTX9) {
       u32 texMtxIdx = (tcg.mtx - GX_TEXMTX0) / 3;
       info.usesTexMtx.set(texMtxIdx);
     }

@@ -11,6 +11,7 @@
 #include <fstream>
 #include <mutex>
 #include <thread>
+#include <unordered_set>
 
 #include <absl/container/flat_hash_map.h>
 #include <magic_enum.hpp>
@@ -105,6 +106,7 @@ static std::atomic_bool g_pipelineThreadEnd;
 static std::condition_variable g_pipelineCv;
 static absl::flat_hash_map<PipelineRef, wgpu::RenderPipeline> g_pipelines;
 static std::deque<std::pair<PipelineRef, NewPipelineCallback>> g_queuedPipelines;
+static std::unordered_set<PipelineRef> g_queuedPipelineRefs;
 static absl::flat_hash_map<BindGroupRef, wgpu::BindGroup> g_cachedBindGroups;
 static absl::flat_hash_map<SamplerRef, wgpu::Sampler> g_cachedSamplers;
 
@@ -158,38 +160,29 @@ static PipelineRef find_pipeline(ShaderType type, const PipelineConfig& config, 
                                  bool serialize = true) {
   PipelineRef hash = xxh3_hash(config, static_cast<HashType>(type));
   bool found = false;
+  bool queued = false;
   {
     std::scoped_lock guard{g_pipelineMutex};
-    found = g_pipelines.contains(hash);
-    if (!found) {
-      const auto ref =
-          std::find_if(g_queuedPipelines.begin(), g_queuedPipelines.end(), [=](auto v) { return v.first == hash; });
-      if (g_hasPipelineThread) {
-        if (ref != g_queuedPipelines.end()) {
-          found = true;
-        }
-      } else {
-        if (ref != g_queuedPipelines.end()) {
-          found = true;
-        } else if (g_pipelinesPerFrame < BuildPipelinesPerFrame) {
-          g_pipelines.try_emplace(hash, cb());
-          if (serialize) {
-            serialize_pipeline_config(type, config);
-          }
-          ++g_pipelinesPerFrame;
-          createdPipelines++;
-          found = true;
-        }
-      }
-    }
-    if (!found) {
-      g_queuedPipelines.emplace_back(std::pair{hash, std::move(cb)});
+    found = g_pipelines.contains(hash) || g_queuedPipelineRefs.contains(hash);
+    if (!found && !g_hasPipelineThread && g_pipelinesPerFrame < BuildPipelinesPerFrame) {
+      g_pipelines.try_emplace(hash, cb());
       if (serialize) {
         serialize_pipeline_config(type, config);
       }
+      ++g_pipelinesPerFrame;
+      createdPipelines++;
+      found = true;
+    }
+    if (!found) {
+      g_queuedPipelines.emplace_back(hash, std::move(cb));
+      g_queuedPipelineRefs.insert(hash);
+      if (serialize) {
+        serialize_pipeline_config(type, config);
+      }
+      queued = true;
     }
   }
-  if (!found) {
+  if (queued) {
     g_pipelineCv.notify_one();
     queuedPipelines++;
   }
@@ -292,6 +285,7 @@ static void pipeline_worker() {
     {
       std::scoped_lock lock{g_pipelineMutex};
       ASSERT(g_pipelines.try_emplace(cb.first, std::move(result)).second, "Duplicate pipeline {}", cb.first);
+      g_queuedPipelineRefs.erase(cb.first);
       g_queuedPipelines.pop_front();
       hasMore = !g_queuedPipelines.empty();
     }
@@ -424,6 +418,7 @@ void shutdown() {
   g_cachedSamplers.clear();
   g_pipelines.clear();
   g_queuedPipelines.clear();
+  g_queuedPipelineRefs.clear();
   g_vertexBuffer = {};
   g_uniformBuffer = {};
   g_indexBuffer = {};

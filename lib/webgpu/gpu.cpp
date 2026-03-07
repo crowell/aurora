@@ -3,6 +3,12 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -10,6 +16,7 @@
 #include <magic_enum.hpp>
 #include <webgpu/webgpu.h>
 #include <webgpu/webgpu_cpp.h>
+#include <xxhash.h>
 
 #include "../internal.hpp"
 #include "../window.hpp"
@@ -39,6 +46,100 @@ wgpu::BindGroup g_CopyBindGroup;
 static wgpu::Adapter g_adapter;
 wgpu::Instance g_instance;
 static wgpu::AdapterInfo g_adapterInfo;
+
+namespace {
+#ifdef WEBGPU_DAWN
+struct DawnBlobCacheContext {
+  std::filesystem::path directory;
+  std::mutex mutex;
+};
+
+std::unique_ptr<DawnBlobCacheContext> g_dawnBlobCache;
+
+std::filesystem::path GetDawnBlobCachePath(const DawnBlobCacheContext& cache, const void* key, size_t keySize) {
+  return cache.directory / fmt::format("{:016x}.bin", XXH3_64bits(key, keySize));
+}
+
+size_t LoadDawnCacheData(const void* key, size_t keySize, void* value, size_t valueSize, void* userdata) {
+  auto* cache = static_cast<DawnBlobCacheContext*>(userdata);
+  if (cache == nullptr) {
+    return 0;
+  }
+
+  std::lock_guard lock(cache->mutex);
+  std::ifstream file(GetDawnBlobCachePath(*cache, key, keySize), std::ios::binary | std::ios::ate);
+  if (!file) {
+    return 0;
+  }
+
+  constexpr size_t headerSize = sizeof(uint64_t);
+  const auto fileSize = file.tellg();
+  if (fileSize < std::streampos{0} || static_cast<uint64_t>(fileSize) < headerSize + keySize) {
+    return 0;
+  }
+
+  file.seekg(0, std::ios::beg);
+  uint64_t storedKeySize = 0;
+  file.read(reinterpret_cast<char*>(&storedKeySize), sizeof(storedKeySize));
+  if (!file || storedKeySize != keySize) {
+    return 0;
+  }
+
+  std::vector<uint8_t> storedKey(keySize);
+  file.read(reinterpret_cast<char*>(storedKey.data()), static_cast<std::streamsize>(storedKey.size()));
+  if (!file || std::memcmp(storedKey.data(), key, keySize) != 0) {
+    return 0;
+  }
+
+  const size_t payloadSize = static_cast<size_t>(fileSize) - headerSize - keySize;
+  if (value == nullptr || valueSize == 0) {
+    return payloadSize;
+  }
+  if (valueSize < payloadSize) {
+    return 0;
+  }
+
+  file.read(reinterpret_cast<char*>(value), static_cast<std::streamsize>(payloadSize));
+  return file ? payloadSize : 0;
+}
+
+void StoreDawnCacheData(const void* key, size_t keySize, const void* value, size_t valueSize, void* userdata) {
+  auto* cache = static_cast<DawnBlobCacheContext*>(userdata);
+  if (cache == nullptr || value == nullptr || valueSize == 0) {
+    return;
+  }
+
+  std::lock_guard lock(cache->mutex);
+  std::ofstream file(GetDawnBlobCachePath(*cache, key, keySize), std::ios::binary | std::ios::trunc);
+  if (!file) {
+    return;
+  }
+
+  const uint64_t storedKeySize = keySize;
+  file.write(reinterpret_cast<const char*>(&storedKeySize), sizeof(storedKeySize));
+  file.write(reinterpret_cast<const char*>(key), static_cast<std::streamsize>(keySize));
+  file.write(reinterpret_cast<const char*>(value), static_cast<std::streamsize>(valueSize));
+}
+
+void InitializeDawnBlobCache() {
+  if (g_dawnBlobCache || g_config.configPath == nullptr) {
+    return;
+  }
+
+  auto cache = std::make_unique<DawnBlobCacheContext>();
+  cache->directory = std::filesystem::path(g_config.configPath) / "dawn_blob_cache";
+
+  std::error_code ec;
+  std::filesystem::create_directories(cache->directory, ec);
+  if (ec) {
+    Log.warn("Failed to create Dawn cache directory {}: {}", cache->directory.string(), ec.message());
+    return;
+  }
+
+  g_dawnBlobCache = std::move(cache);
+}
+#endif
+} // namespace
 
 TextureWithSampler create_render_texture(bool multisampled) {
   const wgpu::Extent3D size{
@@ -448,6 +549,7 @@ bool initialize(AuroraBackend auroraBackend) {
       }
     }
 #ifdef WEBGPU_DAWN
+    InitializeDawnBlobCache();
     const std::array enableToggles{
     /* clang-format off */
 #if _WIN32
@@ -471,10 +573,20 @@ bool initialize(AuroraBackend auroraBackend) {
         .enabledToggleCount = enableToggles.size(),
         .enabledToggles = enableToggles.data(),
     });
+    const wgpu::ChainedStruct* deviceChain = &togglesDescriptor;
+    wgpu::DawnCacheDeviceDescriptor cacheDescriptor{};
+    if (g_dawnBlobCache) {
+      cacheDescriptor.isolationKey = g_config.appName != nullptr ? g_config.appName : "Aurora";
+      cacheDescriptor.loadDataFunction = LoadDawnCacheData;
+      cacheDescriptor.storeDataFunction = StoreDawnCacheData;
+      cacheDescriptor.functionUserdata = g_dawnBlobCache.get();
+      cacheDescriptor.nextInChain = deviceChain;
+      deviceChain = &cacheDescriptor;
+    }
 #endif
     wgpu::DeviceDescriptor deviceDescriptor({
 #ifdef WEBGPU_DAWN
-        .nextInChain = &togglesDescriptor,
+        .nextInChain = deviceChain,
 #endif
         .requiredFeatureCount = requiredFeatures.size(),
         .requiredFeatures = requiredFeatures.data(),
@@ -579,6 +691,9 @@ void shutdown() {
   g_queue = {};
   g_surface = {};
   g_device = {};
+#ifdef WEBGPU_DAWN
+  g_dawnBlobCache.reset();
+#endif
   g_adapter = {};
   g_instance = {};
 }
